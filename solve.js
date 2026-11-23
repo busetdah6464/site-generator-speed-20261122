@@ -17,9 +17,27 @@ function np() {
 
 // ---------------------------------------------------------------- text
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESC_RE = /[&<>"']/g;
+// Manual one-pass escape: ~2x faster than String.replace with a callback
+// (measured on titles/urls/code). Long strings first get a native regex test
+// so a plain long body returns untouched without a per-char JS scan.
+const ESC_TEST = /[&<>"']/;
 export function escapeHtml(text) {
-  return text.replace(ESC_RE, (c) => ESCAPES[c]);
+  if (text.length >= 64 && !ESC_TEST.test(text)) return text;
+  let out = '';
+  let last = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    let rep;
+    if (c === 38) rep = '&amp;';
+    else if (c === 60) rep = '&lt;';
+    else if (c === 62) rep = '&gt;';
+    else if (c === 34) rep = '&quot;';
+    else if (c === 39) rep = '&#39;';
+    else continue;
+    out += text.slice(last, i) + rep;
+    last = i + 1;
+  }
+  return last === 0 ? text : out + text.slice(last);
 }
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -27,28 +45,24 @@ export function longDate(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
-const slugCache = new Map();
-export function slugify(text) {
-  const hit = slugCache.get(text);
-  if (hit !== undefined) return hit;
+export function slugify(text, cache) {
+  if (cache !== undefined) {
+    const hit = cache.get(text);
+    if (hit !== undefined) return hit;
+  }
   let out;
   let ascii = true;
   for (let i = 0; i < text.length; i++) {
     if (text.charCodeAt(i) > 127) { ascii = false; break; }
   }
   if (ascii) {
-    out = '';
-    let gap = false;
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      let keep = null;
-      if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-      else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-      if (keep === null) { gap = out.length > 0; continue; }
-      if (gap) out += '-';
-      gap = false;
-      out += keep;
-    }
+    // One native replace: runs of non-alphanumerics become one '-'; a
+    // leading/trailing '-' (at most one each, runs already collapsed) is
+    // dropped. Truncate first, then drop a '-' left at the cut, exactly
+    // like the character loop this replaces.
+    out = text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    out = out.slice(0, 64);
+    if (out.charCodeAt(out.length - 1) === 45) out = out.slice(0, -1);
   } else {
     const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
     out = '';
@@ -62,10 +76,10 @@ export function slugify(text) {
       gap = false;
       out += keep;
     }
+    out = out.slice(0, 64).replace(/-+$/, '');
   }
-  out = out.slice(0, 64).replace(/-+$/, '');
   if (out === '') out = 'untitled';
-  if (slugCache.size < 8192) slugCache.set(text, out);
+  if (cache !== undefined && cache.size < 8192) cache.set(text, out);
   return out;
 }
 
@@ -182,8 +196,6 @@ const HR_RE = /^(?:---|\*\*\*)[ \t]*$/;
 const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
-const SPEC_RE = /[\\`*\[&<>"']/g;
-const WS_RE = /\s/;
 const WS1_RE = /^\s$/;
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
@@ -217,115 +229,63 @@ function endsParagraph(line) {
   return false;
 }
 
-// Count of consecutive backslashes immediately before index j in s.
-function backslashRun(s, j) {
-  let n = 0;
-  while (j - 1 - n >= 0 && s[j - 1 - n] === '\\') n++;
-  return n;
-}
-// First index >= from where s holds `what` outside a backslash escape, or -1.
-function findUnescaped(s, what, from) {
-  let j = s.indexOf(what, from);
-  while (j !== -1) {
-    if (backslashRun(s, j) % 2 === 1) j = s.indexOf(what, j + 1);
-    else return j;
-  }
-  return -1;
-}
-// First single * from `from` (one whose run is not **), outside an escape, or -1.
-function findSingleStar(s, from) {
-  let j = s.indexOf('*', from);
-  while (j !== -1) {
-    if (backslashRun(s, j) % 2 === 1) { j = s.indexOf('*', j + 1); continue; }
-    if (s[j + 1] === '*') { j = s.indexOf('*', j + 2); continue; }
-    return j;
-  }
-  return -1;
-}
+// One combined pattern for inline rendering, tried in order at each
+// position: code span, strong, a literal ** (a strong that cannot close
+// skips both stars, exactly like the loop it replaces), emphasis, link,
+// backslash escape, lone backslash, and the five escaped characters.
+// The emphasis and link closers carry a lookbehind that rejects an odd run
+// of backslashes before them (an escaped closer is no closer): the inner
+// patterns consume escape pairs and ** pairs greedily, and the lookbehind
+// plus the (?!) guards keep a backtrack from ever reopening one as a
+// closer. String.replace does the scanning and the string building
+// natively, and nested emphasis and link text recurse through the same
+// pattern (replace reentrancy on one shared /g pattern is safe: its
+// lastIndex resets per call).
+const INLINE_RE = /`([^`]+)`|\*\*((?:\\[\s\S]|[^*\\]|\*(?!\*))+)\*\*|\*\*|\*((?:\\[\s\S]|[^*\\]|\*\*)+)(?<!(?:^|[^\\])(?:\\\\)*\\)\*(?!\*)|\[((?:\\[\s\S]|[^\\\]])*)(?<!(?:^|[^\\])(?:\\\\)*\\)\]\(([^)\s]+)\)|\\([\\`*_[\]()#+\-.!>])|\\|[&<>"']/g;
 
 function inline(s, link) {
-  let out = '';
-  let i = 0;
-  const n = s.length;
-  while (i < n) {
-    SPEC_RE.lastIndex = i;
-    const m = SPEC_RE.exec(s);
-    if (m === null) {
-      out += s.slice(i);
-      break;
+  return s.replace(INLINE_RE, (m, code, strong, em, ltext, ltarget, esc) => {
+    if (code !== undefined) return `<code>${escapeHtml(code)}</code>`;
+    if (strong !== undefined) return `<strong>${inline(strong, link)}</strong>`;
+    if (m === '**') return '**';
+    if (em !== undefined) return `<em>${inline(em, link)}</em>`;
+    if (ltext !== undefined) return `<a href="${escapeHtml(link(ltarget))}">${inline(ltext, link)}</a>`;
+    if (esc !== undefined) {
+      const e = ESCAPES[esc];
+      return e === undefined ? esc : e;
     }
-    const j = m.index;
-    if (j > i) out += s.slice(i, j);
-    const c = s[j];
-    if (c === '&') { out += '&amp;'; i = j + 1; continue; }
-    if (c === '<') { out += '&lt;'; i = j + 1; continue; }
-    if (c === '>') { out += '&gt;'; i = j + 1; continue; }
-    if (c === '"') { out += '&quot;'; i = j + 1; continue; }
-    if (c === "'") { out += '&#39;'; i = j + 1; continue; }
-    if (c === '\\' && j + 1 < n && ESCAPABLE.has(s[j + 1])) {
-      out += escapeHtml(s[j + 1]);
-      i = j + 2;
-      continue;
-    }
-    if (c === '`') {
-      const k = s.indexOf('`', j + 1);
-      if (k > j + 1) {
-        out += `<code>${escapeHtml(s.slice(j + 1, k))}</code>`;
-        i = k + 1;
-      } else {
-        out += '`';
-        i = j + 1;
-      }
-      continue;
-    }
-    if (c === '*') {
-      if (s[j + 1] === '*') {
-        const k = findUnescaped(s, '**', j + 2);
-        if (k > j + 2) {
-          out += `<strong>${inline(s.slice(j + 2, k), link)}</strong>`;
-          i = k + 2;
-        } else {
-          out += '**';
-          i = j + 2;
-        }
-        continue;
-      }
-      const k = findSingleStar(s, j + 1);
-      if (k > j + 1) {
-        out += `<em>${inline(s.slice(j + 1, k), link)}</em>`;
-        i = k + 1;
-      } else {
-        out += '*';
-        i = j + 1;
-      }
-      continue;
-    }
-    if (c === '[') {
-      const k = findUnescaped(s, ']', j + 1);
-      const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = mm === -1 ? '' : s.slice(k + 2, mm);
-      if (target !== '' && !WS_RE.test(target)) {
-        out += `<a href="${escapeHtml(link(target))}">${inline(s.slice(j + 1, k), link)}</a>`;
-        i = mm + 1;
-      } else {
-        out += '[';
-        i = j + 1;
-      }
-      continue;
-    }
-    // A lone backslash (not before an escapable character) is itself.
-    out += '\\';
-    i = j + 1;
-  }
-  return out;
+    if (m === '\\') return '\\';
+    return ESCAPES[m];
+  });
 }
 
-// Renders lines[lo..hi) to { html, toc, excerpt }. link(target) resolves a link.
-function renderMarkdown(lines, lo, hi, link) {
+// Words in one line: the runs of non-whitespace. Tight loop: space/tab
+// first; only a non-ASCII char pays for the single-char whitespace test.
+// Matches /\S+/g exactly (every other code unit is a word character).
+function wordsInLine(s) {
+  let n = 0;
+  let inWord = false;
+  for (let j = 0; j < s.length; j++) {
+    const c = s.charCodeAt(j);
+    if (c === 32 || c === 9 || c === 11 || c === 12 || c === 13) inWord = false;
+    else if (c > 127) {
+      if (WS1_RE.test(s[j])) inWord = false;
+      else if (!inWord) { inWord = true; n++; }
+    } else if (!inWord) { inWord = true; n++; }
+  }
+  return n;
+}
+
+// Renders lines[lo..hi) to { html, toc, excerpt, words }. link(target) resolves a link.
+// The word count rides along: every line is counted exactly once, at the
+// place that consumes it (a block's first line at its branch, later lines
+// in the branch's own loop), so there is no second pass over the lines.
+function renderMarkdown(lines, lo, hi, link, slugCache) {
   const ids = new Set();
   const blocks = [];
   const toc = [];
   let excerpt = null;
+  let words = 0;
   let i = lo;
   while (i < hi) {
     const line = lines[i];
@@ -338,10 +298,12 @@ function renderMarkdown(lines, lo, hi, link) {
     } else if (c0 === 96 && line.startsWith('```')) { // '`'
       const fence = FENCE_OPEN_RE.exec(line);
       if (fence !== null) {
+        words += wordsInLine(line);
         const lang = fence[1];
         const body = [];
         i++;
-        while (i < hi && !FENCE_CLOSE_RE.test(lines[i])) body.push(lines[i++]);
+        while (i < hi && !FENCE_CLOSE_RE.test(lines[i])) { words += wordsInLine(lines[i]); body.push(lines[i++]); }
+        if (i < hi) words += wordsInLine(lines[i]); // the close line: ``` is one word
         i++;
         const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
         blocks.push(`<pre><code${cls}>${body.length === 0 ? '' : `${escapeHtml(body.join('\n'))}\n`}</code></pre>\n`);
@@ -350,7 +312,8 @@ function renderMarkdown(lines, lo, hi, link) {
     } else if (c0 === 35) { // '#'
       const heading = headingOf(line);
       if (heading !== null) {
-        const id = uniqueSlug(slugify(heading.text), ids);
+        words += wordsInLine(line);
+        const id = uniqueSlug(slugify(heading.text, slugCache), ids);
         const html = inline(heading.text, link);
         blocks.push(`<h${heading.depth} id="${id}">${html}</h${heading.depth}>\n`);
         if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html });
@@ -359,6 +322,7 @@ function renderMarkdown(lines, lo, hi, link) {
       }
     } else if (c0 === 45 || c0 === 42) { // '-' '*'
       if (HR_RE.test(line)) {
+        words += wordsInLine(line);
         blocks.push('<hr>\n');
         i++;
         continue;
@@ -369,9 +333,11 @@ function renderMarkdown(lines, lo, hi, link) {
         while (i < hi) {
           const mm = BULLET_RE.exec(lines[i]);
           if (mm !== null) {
+            words += wordsInLine(lines[i]);
             items.push([trimLine(mm[1])]);
             i++;
           } else if (CONTINUED_RE.test(lines[i])) {
+            words += wordsInLine(lines[i]);
             items[items.length - 1].push(trimLine(lines[i]));
             i++;
           } else break;
@@ -383,7 +349,7 @@ function renderMarkdown(lines, lo, hi, link) {
       }
     } else if (c0 === 62) { // '>'
       const body = [];
-      while (i < hi && lines[i].charCodeAt(0) === 62) body.push(lines[i++].replace(/^> ?/, ''));
+      while (i < hi && lines[i].charCodeAt(0) === 62) { words += wordsInLine(lines[i]); body.push(lines[i++].replace(/^> ?/, '')); }
       const inner = body.map(trimLine).filter((l) => l !== '');
       blocks.push(inner.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(inner.join('\n'), link)}</p>\n</blockquote>\n`);
       continue;
@@ -394,9 +360,11 @@ function renderMarkdown(lines, lo, hi, link) {
         while (i < hi) {
           const mm = ORDERED_RE.exec(lines[i]);
           if (mm !== null) {
+            words += wordsInLine(lines[i]);
             items.push([trimLine(mm[2])]);
             i++;
           } else if (CONTINUED_RE.test(lines[i])) {
+            words += wordsInLine(lines[i]);
             items[items.length - 1].push(trimLine(lines[i]));
             i++;
           } else break;
@@ -411,14 +379,15 @@ function renderMarkdown(lines, lo, hi, link) {
     }
     // Paragraph (also reached for space/tab-opening lines and for lines
     // whose first character ruled out every other block).
+    words += wordsInLine(line);
     const body = [trimLine(line)];
     i++;
-    while (i < hi && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < hi && !endsParagraph(lines[i])) { words += wordsInLine(lines[i]); body.push(trimLine(lines[i++])); }
     const html = inline(body.join('\n'), link);
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>\n`);
   }
-  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.join(''), toc, excerpt: excerpt ?? '', words };
 }
 
 function resolvePath(dir, rel) {
@@ -565,12 +534,21 @@ function genNodes(nodes, out) {
     if (n.kind === 'text') {
       out.push(`o.push(${JSON.stringify(n.text)});`);
     } else if (n.kind === 'var') {
-      out.push(`o.push(esc(txt(${lookupExpr(n.path)})));`);
+      // Inline textOf for the common cases: a string is escaped directly, a
+      // number/boolean stringifies without escaping (its digits never need
+      // it), and only arrays/objects still go through txt(). The lookup
+      // runs once into a temp, not twice.
+      const id = tmpCounter++;
+      out.push(`{var v${id}=${lookupExpr(n.path)};o.push(v${id}==null?'':typeof v${id}==='string'?esc(v${id}):typeof v${id}==='number'||typeof v${id}==='boolean'?String(v${id}):esc(txt(v${id})));}`);
     } else if (n.kind === 'raw') {
-      out.push(`o.push(txt(${lookupExpr(n.path)}));`);
+      const id = tmpCounter++;
+      out.push(`{var v${id}=${lookupExpr(n.path)};o.push(typeof v${id}==='string'?v${id}:txt(v${id}));}`);
     } else if (n.kind === 'if') {
-      const cond = `${n.not ? '!' : ''}truthy(${lookupExpr(n.path)})`;
-      out.push(`if(${cond}){`);
+      // Inline truthy(): the lookup runs once into a temp, and the test is
+      // the same logic (not undefined/null/false/""/0, and a non-empty
+      // array) without a helper call per if.
+      const id = tmpCounter++;
+      out.push(`{var v${id}=${lookupExpr(n.path)};if(${n.not ? '!' : ''}(v${id}!==undefined&&v${id}!==null&&v${id}!==false&&v${id}!==''&&v${id}!==0&&(!Array.isArray(v${id})||v${id}.length>0))){`);
       genNodes(n.then, out);
       out.push('}');
       if (n.else !== null) {
@@ -578,6 +556,7 @@ function genNodes(nodes, out) {
         genNodes(n.else, out);
         out.push('}');
       }
+      out.push('}');
     } else if (n.kind === 'for') {
       const id = tmpCounter++;
       out.push(`{var xs${id}=${lookupExpr(n.path)};if(Array.isArray(xs${id})){var sc${id}=Object.create(scope);var lp${id}=Object.create(null);lp${id}.index=0;lp${id}.first=true;lp${id}.last=false;lp${id}.length=xs${id}.length;for(var k${id}=0;k${id}<xs${id}.length;k${id}++){sc${id}[${JSON.stringify(n.name)}]=xs${id}[k${id}];lp${id}.index=k${id}+1;lp${id}.first=k${id}===0;lp${id}.last=k${id}===xs${id}.length-1;sc${id}.loop=lp${id};{let scope=sc${id};`);
@@ -604,25 +583,13 @@ function compileTemplate(nodes) {
 // ---------------------------------------------------------------- build
 const RESERVED = ['posts', 'tags', 'page'];
 
-function wordsOfLines(lines, lo, hi) {
-  let n = 0;
-  for (let i = lo; i < hi; i++) {
-    const s = lines[i];
-    let inWord = false;
-    for (let j = 0; j < s.length; j++) {
-      const c = s.charCodeAt(j);
-      if (c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || (c > 127 && WS1_RE.test(s[j]))) inWord = false;
-      else if (!inWord) { inWord = true; n++; }
-    }
-  }
-  return n;
-}
-
 function dirOf(path) {
   return path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
 }
 
 export function run(input) {
+  // Per-case slug cache: nothing is carried from one case to the next.
+  const slugCache = new Map();
   const report = [];
   const templates = new Map();
   const names = Object.keys(input.templates).sort(byCodeUnits);
@@ -695,7 +662,7 @@ export function run(input) {
       set = new Set(dir === '' ? RESERVED : []);
       taken.set(dir, set);
     }
-    const slug = uniqueSlug(s.data.slug ?? slugify(s.data.title), set);
+    const slug = uniqueSlug(s.data.slug ?? slugify(s.data.title, slugCache), set);
     s.slug = slug;
     s.outDir = dir === '' ? slug : `${dir}/${slug}`;
     s.url = `${base}/${s.outDir}/`;
@@ -718,11 +685,11 @@ export function run(input) {
       broken.add(`broken-link ${srcPath} -> ${target}`);
       return target;
     };
-    const md = renderMarkdown(s.lines, s.bodyStart, s.lines.length, link);
+    const md = renderMarkdown(s.lines, s.bodyStart, s.lines.length, link, slugCache);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.words = wordsOfLines(s.lines, s.bodyStart, s.lines.length);
+    s.words = md.words;
   }
 
   const posts = kept.filter((s) => s.post);
@@ -737,7 +704,7 @@ export function run(input) {
     const seen = new Set();
     const out = [];
     for (const name of (s.data.tags ?? [])) {
-      const slug = slugify(name);
+      const slug = slugify(name, slugCache);
       if (!seen.has(slug)) { seen.add(slug); out.push(name); }
     }
     return out;
@@ -745,7 +712,7 @@ export function run(input) {
   for (const p of posts) {
     p.tagRefs = [];
     for (const name of ownTags(p)) {
-      const slug = slugify(name);
+      const slug = slugify(name, slugCache);
       let tag = bySlug.get(slug);
       if (tag === undefined) {
         tag = np();
@@ -762,7 +729,7 @@ export function run(input) {
   for (const s of kept) {
     if (!s.post) {
       s.tagRefs = ownTags(s).map((name) => {
-        const slug = slugify(name);
+        const slug = slugify(name, slugCache);
         const found = bySlug.get(slug);
         if (found !== undefined) return found;
         const t = np();
